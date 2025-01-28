@@ -695,6 +695,22 @@ class Tissue:
         F = get_F(vs, neighbours, self.tris, self.CV_matrix, self.n_v, self.n_c, self.L, J_CW, J_CCW, self.A, self.P, self.Cents, self.kappa_A, self.kappa_P, self.A0, self.P0,self.n_C,self.kappa_B,self.l_b0)
         return F
 
+    def build_cell_adjacency(self) -> np.ndarray:
+        """
+        Constructs an (n_c x n_c) adjacency matrix for the cells, based on
+        the Delaunay triangulation self.tris.
+        Two cells i and j are marked as neighbors if they appear together
+        in at least one triangle (row of self.tris).
+        """
+        adjacency = np.zeros((self.n_c, self.n_c), dtype=np.int8)
+        for c1, c2, c3 in self.tris:
+            adjacency[c1, c2] = 1
+            adjacency[c2, c1] = 1
+            adjacency[c2, c3] = 1
+            adjacency[c3, c2] = 1
+            adjacency[c3, c1] = 1
+            adjacency[c1, c3] = 1
+        return adjacency
 
 
     def simulate(self, print_every=1000, variable_param=False, \
@@ -713,76 +729,89 @@ class Tissue:
         """
 
         # TODO: detect whether kappa_* are vectors and act accordingly.
-        if variable_param is True:
+        if variable_param:
             F_get = self.get_F_periodic_param
         else:
             F_get = self.get_F_periodic
-        
-        # Get number of time steps.
+
         n_t = self.t_span.size
         self.n_t = n_t
-        
-        # Perform initial triangulation of the cell centers 'x'. 
+
+        # 1) Triangulate initial positions
         x = self.x0.copy()
         self._triangulate_periodic(x)
         self.x = x.copy()
+
         self.x_save = np.zeros((n_t, self.n_c, 2))
         self.tri_save = np.zeros((n_t, self.tris.shape[0], 3), dtype=np.int32)
-        self.assign_vertices()      # fills self.CV_matrix
-        self.get_A_periodic(self.neighbours, self.vs)   # get cell areas. TODO: better function name
-        self.get_P_periodic(self.neighbours, self.vs)   # get cell perimeters. TODO: the same
 
-        # Generate random motility noise.
-        self.generate_noise(rng_seed)       # fills self.noise
-        noise = np.transpose( [self.noise[0,:][:,0], self.noise[0,:][:,1]] )
+        self.assign_vertices()
+        self.get_A_periodic(self.neighbours, self.vs)
+        self.get_P_periodic(self.neighbours, self.vs)
 
-        # TODO: initial state is not stored currently
+        # 2) Generate random noise
+        self.generate_noise(rng_seed=rng_seed)
 
         for i in range(n_t):
-            if (i%print_every == 0):
-                print('%.1f%% --- Cell areas mean, min., max.: %.2f, %.2f, %.2f' \
-                      %(i/n_t*100, np.mean(self.A), np.min(self.A), np.max(self.A)))
-            
-            # Triangulate cell centers. Calling Delaunay at every step for now.
+            if (i % print_every == 0):
+                print(
+                    f"{(i/n_t)*100:.1f}% done --- "
+                    f"Cell areas: mean={np.mean(self.A):.2f}, "
+                    f"min={np.min(self.A):.2f}, max={np.max(self.A):.2f}"
+                )
+
+            # 3) Triangulate + compute areas/perimeters
             self._triangulate_periodic(x)
-            # self.triangulate_periodic(x)        # equiangulate
             self.tri_save[i] = self.tris
-            self.assign_vertices()      # fills self.CV_matrix
-            self.get_A_periodic(self.neighbours, self.vs)   # get cell areas. TODO: better function name
-            self.get_P_periodic(self.neighbours, self.vs)   # get cell perimeters. TODO: the same
+            self.assign_vertices()
 
-            # Compute the main motility force and a weak short-range repulsion
-            # to avoid unphysical configurations:
+            self.get_A_periodic(self.neighbours, self.vs)
+            self.get_P_periodic(self.neighbours, self.vs)
+
+            # 4) Forces
             F = F_get(self.neighbours, self.vs)
-            F_soft = weak_repulsion(self.Cents, self.a, self.k, self.CV_matrix, \
-                                    self.n_c, self.domain_size)
-            
-            # Set per-cell noise given the multipliers for each cell type.
-            v0 = [self.v0[j] for j in self.c_types]
-            noise = np.transpose( [v0*self.noise[i,:][:,0], v0*self.noise[i,:][:,1]] )
+            F_soft = weak_repulsion(self.Cents, self.a, self.k,
+                                    self.CV_matrix, self.n_c, self.domain_size)
 
-            # Update cell centroid positions with explicit Euler.
-            x += self.dt*(F + F_soft + noise)       # Barton eq. (13)
-            # x += self.dt*(F + F_soft + self.v0*self.noise[i])     # scalar self.v0
+            # 5) Apply noise with v0
+            #    v0 = activity per cell type, so build for each cell
+            v0_array = [self.v0[j] for j in self.c_types]
+            noise_vec = self.noise[i, :, :]  # shape [n_c, 2]
+            noise_scaled = np.column_stack(
+                (v0_array * noise_vec[:, 0], v0_array * noise_vec[:, 1])
+            )
 
-            # Impose periodicity to cell positions (Delaunay vertices).
-            # E.g., if a cell position is x = 1.2, while domain width is 
-            # L = 1.0, the correct position in a periodic domain is 
-            # x_new = mod(x,L) = 0.2.
-            x = np.mod(x, self.domain_size)
+            # 6) Update positions (Euler step)
+            x += self.dt * (F + F_soft + noise_scaled)
+            x = np.mod(x, self.domain_size)  # periodic wrap
 
             self.x = x
             self.x_save[i] = x
 
-            # Plot current state every integer time point.
+            # 7) Save data at each integer time step
             if (np.mod(i*self.dt, 1) == 0):
-                data = np.array([self.domain_size, self.x_save[i], self.c_types], dtype=object)
-                np.save("%s/%d.npy" %(output_dir, i), data, allow_pickle=True)
-                # plot_step( self.x_save[i], i, self.domain_size, self.c_types, self.colors, 
-                #            self.plot_scatter, self.tris, dir_name=output_dir )
-        
-        print("Simulation complete")
+                # (a) Save old format => domain_size, x, c_types
+                data_legacy = np.array([self.domain_size, self.x_save[i], self.c_types],
+                                    dtype=object)
+                np.save(f"{output_dir}/{i}.npy", data_legacy, allow_pickle=True)
 
+                # (b) Build adjacency
+                cell_adj = self.build_cell_adjacency()
+
+                # (c) Create data dictionary
+                data_dict = {
+                    "cell_x": x.copy(),
+                    "cell_type": self.c_types.copy(),
+                    "area": self.A.copy(),
+                    "perimeter": self.P.copy(),
+                    "cell_adj": cell_adj.copy(),
+                    "voronoi_nodes": self.vs.copy()
+                }
+
+                # (d) Save to e.g. data_0.npy, data_100.npy, etc.
+                np.save(f"{output_dir}/data_{i}.npy", data_dict, allow_pickle=True)
+
+        print("Simulation complete.")
         return self.x_save, self.tri_save
 
 
