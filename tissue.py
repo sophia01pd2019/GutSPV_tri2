@@ -30,7 +30,42 @@ from scipy.sparse.csgraph import connected_components
 from spv_math import *
 from spv_plot import *
 
+def order_voronoi_vertices(vertex_ids, v_neighbours):
+        """
+        Given a list of Voronoi vertex IDs that all belong to the same cell–cell boundary,
+        place them in CCW order by walking the `v_neighbours` adjacency.
 
+        Simplest approach:
+        1. Start with any vertex in vertex_ids.
+        2. Find the next that shares an edge with it and also is in vertex_ids.
+        3. Continue until you recover a loop (or run out).
+
+        Returns: an ordered list of vertex IDs.
+        """
+        if len(vertex_ids) <= 2:
+            # With only 2 vertices, there's no fancy cycle to order.
+            return vertex_ids
+
+        ordered = [vertex_ids[0]]
+        used = set([vertex_ids[0]])
+
+        # Repeatedly pick a neighbor that is in vertex_ids but not used yet.
+        current = vertex_ids[0]
+        while True:
+            found_next = False
+            for nb in v_neighbours[current]:
+                if nb in vertex_ids and nb not in used and nb >= 0:
+                    # neighbor is a valid next vertex in the chain
+                    ordered.append(nb)
+                    used.add(nb)
+                    current = nb
+                    found_next = True
+                    break
+            if not found_next:
+                # No more neighbors in the set => we might have closed a loop or ended
+                break
+
+        return ordered
 
 class Tissue:
     def __init__(self, x0=[], P=[]):
@@ -712,42 +747,102 @@ class Tissue:
             adjacency[c1, c3] = 1
         return adjacency
 
-    def order_voronoi_vertices(vertex_ids, v_neighbours):
+    
+    
+
+
+    def build_cell_adjacency_with_lengths(self):
         """
-        Given a list of Voronoi vertex IDs that all belong to the same cell–cell boundary,
-        place them in CCW order by walking the `v_neighbours` adjacency.
+        Returns three (n_c x n_c) arrays:
+          1. adjacency: 1 if cells i,j share an edge in the Delaunay, else 0
+          2. delaunay_dist: centroid-to-centroid distance (0 if not neighbors)
+          3. voronoi_length: length of the shared Voronoi boundary (0 if not neighbors)
 
-        Simplest approach:
-        1. Start with any vertex in vertex_ids.
-        2. Find the next that shares an edge with it and also is in vertex_ids.
-        3. Continue until you recover a loop (or run out).
-
-        Returns: an ordered list of vertex IDs.
+        We'll rely on:
+          self.x         : shape [n_c, 2], cell centroid positions
+          self.tris      : shape [n_v, 3], each row is triple of cell IDs
+          self.vs        : shape [n_v, 2], Voronoi vertex positions
+          self.v_neighbours : shape [n_v, 3], adjacency among Voronoi vertices
         """
-        if len(vertex_ids) <= 2:
-            # With only 2 vertices, there's no fancy cycle to order.
-            return vertex_ids
+        n_c = self.n_c
 
-        ordered = [vertex_ids[0]]
-        used = set([vertex_ids[0]])
+        adjacency = np.zeros((n_c, n_c), dtype=np.int8)
+        delaunay_dist = np.zeros((n_c, n_c), dtype=np.float32)
+        voronoi_length = np.zeros((n_c, n_c), dtype=np.float32)
 
-        # Repeatedly pick a neighbor that is in vertex_ids but not used yet.
-        current = vertex_ids[0]
-        while True:
-            found_next = False
-            for nb in v_neighbours[current]:
-                if nb in vertex_ids and nb not in used and nb >= 0:
-                    # neighbor is a valid next vertex in the chain
-                    ordered.append(nb)
-                    used.add(nb)
-                    current = nb
-                    found_next = True
-                    break
-            if not found_next:
-                # No more neighbors in the set => we might have closed a loop or ended
-                break
+        #------------------------------------------------------
+        # 1. Basic adjacency + store Delaunay (centroid) distance
+        #------------------------------------------------------
+        # For each "Voronoi vertex" row in self.tris,
+        # we see cells (c1, c2, c3) that meet there.
+        # Mark c1-c2, c2-c3, c3-c1 as neighbors in adjacency.
+        for (c1, c2, c3) in self.tris:
+            for (a, b) in [(c1, c2), (c2, c3), (c3, c1)]:
+                if adjacency[a, b] == 0:
+                    adjacency[a, b] = 1
+                    adjacency[b, a] = 1
+                    dist_ab = np.linalg.norm(self.x[a] - self.x[b])
+                    delaunay_dist[a, b] = dist_ab
+                    delaunay_dist[b, a] = dist_ab
 
-        return ordered
+        #------------------------------------------------------
+        # 2. For each pair of neighbors (i,j), find the set
+        #    of Voronoi vertices that belong to i & j.
+        #    Then sum up the edges among them.
+        #------------------------------------------------------
+        # Build a small structure: for each Voronoi vertex v,
+        # we know the triple of cells tri_cells = self.tris[v].
+        # This helps find which vertices are used by (i,j).
+        from collections import defaultdict
+        vertices_for_pair = defaultdict(list)  # keys=(i,j) => list of vertex IDs
+
+        for v_idx in range(self.n_v):
+            c1, c2, c3 = self.tris[v_idx]
+            # For each pair in (c1,c2,c3), store v_idx
+            for (a, b) in [(c1, c2), (c2, c3), (c3, c1)]:
+                # Sort the pair so (min, max) is the dict key => avoid duplication
+                if a != b:
+                    ij = (a, b) if a < b else (b, a)
+                    vertices_for_pair[ij].append(v_idx)
+
+        # Now compute boundary length for each neighbor pair
+        for i in range(n_c):
+            for j in range(i+1, n_c):
+                if adjacency[i, j] == 1:
+                    # gather Voronoi vertices that are corners of i–j boundary
+                    ij = (i, j)
+                    if i > j:
+                        ij = (j, i)
+
+                    v_list = vertices_for_pair.get(ij, [])
+                    if not v_list:
+                        continue  # no Voronoi vertices? Should not happen if adjacency=1
+
+                    # Order them in a ring so we can sum distances
+                    v_list_ordered = order_voronoi_vertices(v_list, self.v_neighbours)
+                    
+                    # sum of consecutive segments
+                    L = 0.0
+                    for idx in range(len(v_list_ordered)-1):
+                        vA = v_list_ordered[idx]
+                        vB = v_list_ordered[idx+1]
+                        L += np.linalg.norm(self.vs[vA] - self.vs[vB])
+
+                    # If it forms a closed loop, you might want to
+                    # also connect the last to the first. Usually,
+                    # for a 2D boundary between just two cells, you get
+                    # a chain, not a fully closed loop. So typically we do not
+                    # connect last->first. 
+                    #
+                    # If you *do* want to close a loop, add:
+                    #   if len(v_list_ordered) > 2:
+                    #       L += np.linalg.norm(self.vs[v_list_ordered[-1]] 
+                    #                                    - self.vs[v_list_ordered[0]])
+
+                    voronoi_length[i, j] = L
+                    voronoi_length[j, i] = L
+
+        return adjacency, delaunay_dist, voronoi_length
 
     def simulate(self, print_every=1000, variable_param=False,
              output_dir="plots", rng_seed=1):
@@ -764,6 +859,7 @@ class Tissue:
         :param rng_seed: random seed
         :return: (self.x_save, self.tri_save)
         """
+        
         # If you have a separate method for param variation:
         if variable_param:
             F_get = self.get_F_periodic_param
@@ -855,135 +951,139 @@ class Tissue:
         return self.x_save, self.tri_save
 
 
-    def simulate_boundary(self, print_every=1000, do_F_bound=True,
-                      output_dir="plots", rng_seed=1):
-        """
-        Evolve the SPV but with boundary particles.
+# need to define: def build_cell_adjacency_with_lengths(self):
+    # ...
+    # return adjacency, delaunay_dist, voronoi_length
 
-        Stores:
-            self.x_save = Cell centroids for each time-step (n_t x n_c x 2)
-            self.tri_save = Triangulation (n_t x n_v x 3)
+    # def simulate_boundary(self, print_every=1000, do_F_bound=True,
+    #                   output_dir="plots", rng_seed=1):
+    #     """
+    #     Evolve the SPV but with boundary particles.
 
-        :param print_every: how often to print progress
-        :param do_F_bound: include boundary tension forces if True
-        :param output_dir: folder to save outputs
-        :param rng_seed: random seed
-        :return: self.x_save
-        """
-        n_t = self.t_span.size
-        self.n_t = n_t
-        x = self.x0.copy()
-        self._triangulate(x)
-        self.assign_vertices()
-        x = self.check_boundary(x)
-        self.x = x.copy()
+    #     Stores:
+    #         self.x_save = Cell centroids for each time-step (n_t x n_c x 2)
+    #         self.tri_save = Triangulation (n_t x n_v x 3)
 
-        self.x_save = np.ones((n_t, int(self.n_c*self.b_extra), 2))*np.nan
-        self.tri_save = -np.ones((n_t, int(self.tris.shape[0]*self.b_extra), 3), dtype=np.int32)
+    #     :param print_every: how often to print progress
+    #     :param do_F_bound: include boundary tension forces if True
+    #     :param output_dir: folder to save outputs
+    #     :param rng_seed: random seed
+    #     :return: self.x_save
+    #     """
+    #     n_t = self.t_span.size
+    #     self.n_t = n_t
+    #     x = self.x0.copy()
+    #     self._triangulate(x)
+    #     self.assign_vertices()
+    #     x = self.check_boundary(x)
+    #     self.x = x.copy()
 
-        # Generate boundary noise
-        self.generate_noise_boundary(rng_seed=rng_seed)
+    #     self.x_save = np.ones((n_t, int(self.n_c*self.b_extra), 2))*np.nan
+    #     self.tri_save = -np.ones((n_t, int(self.tris.shape[0]*self.b_extra), 3), dtype=np.int32)
 
-        if do_F_bound is True:
-            for i in range(n_t):
-                if i % print_every == 0:
-                    print(f"{(i / n_t)*100:.1f}%")
+    #     # Generate boundary noise
+    #     self.generate_noise_boundary(rng_seed=rng_seed)
 
-                self.triangulate(x, recalc_angles=True)
-                self.assign_vertices()
-                x = self.check_boundary(x)
+    #     if do_F_bound is True:
+    #         for i in range(n_t):
+    #             if i % print_every == 0:
+    #                 print(f"{(i / n_t)*100:.1f}%")
 
-                self.tri_save[i, :self.tris.shape[0]] = self.tris
-                self.get_A(self.neighbours, self.vs)
-                self.get_P(self.neighbours, self.vs)
+    #             self.triangulate(x, recalc_angles=True)
+    #             self.assign_vertices()
+    #             x = self.check_boundary(x)
 
-                F = self.get_F(self.neighbours, self.vs)
-                F_soft = weak_repulsion_boundary(self.Cents, self.a, self.k,
-                                                self.CV_matrix, self.n_c, self.n_C)
-                F_bound = boundary_tension(self.Gamma_bound, self.n_C, self.n_c,
-                                        self.Cents, self.CV_matrix)
+    #             self.tri_save[i, :self.tris.shape[0]] = self.tris
+    #             self.get_A(self.neighbours, self.vs)
+    #             self.get_P(self.neighbours, self.vs)
 
-                # Combine noise for cells + boundary
-                v0 = [self.v0[j] for j in self.c_types]
-                vp = np.repeat(1, self.n_c - self.n_C) * self.v0[-1]  # boundary part
-                v0 = np.concatenate((v0, vp))
-                noise = np.transpose(
-                    [v0*self.noise[i, :x.shape[0]][:, 0],
-                    v0*self.noise[i, :x.shape[0]][:, 1]]
-                )
+    #             F = self.get_F(self.neighbours, self.vs)
+    #             F_soft = weak_repulsion_boundary(self.Cents, self.a, self.k,
+    #                                             self.CV_matrix, self.n_c, self.n_C)
+    #             F_bound = boundary_tension(self.Gamma_bound, self.n_C, self.n_c,
+    #                                     self.Cents, self.CV_matrix)
 
-                x += self.dt*(F + F_soft + noise + F_bound)
-                self.x = x
-                self.x_save[i, :x.shape[0]] = x
+    #             # Combine noise for cells + boundary
+    #             v0 = [self.v0[j] for j in self.c_types]
+    #             vp = np.repeat(1, self.n_c - self.n_C) * self.v0[-1]  # boundary part
+    #             v0 = np.concatenate((v0, vp))
+    #             noise = np.transpose(
+    #                 [v0*self.noise[i, :x.shape[0]][:, 0],
+    #                 v0*self.noise[i, :x.shape[0]][:, 1]]
+    #             )
 
-                # Save data at each integer time step
-                if np.mod(i*self.dt, 1) == 0:
-                    # Build adjacency + geometry
-                    (cell_adj,
-                    dist_delaunay,
-                    length_voronoi) = self.build_cell_adjacency_with_lengths()
+    #             x += self.dt*(F + F_soft + noise + F_bound)
+    #             self.x = x
+    #             self.x_save[i, :x.shape[0]] = x
 
-                    data_dict = {
-                        "cell_x": x.copy(),
-                        "cell_type": self.c_types.copy(),
-                        "area": self.A.copy(),
-                        "perimeter": self.P.copy(),
-                        "cell_adj": cell_adj.copy(),
-                        "edge_delaunay_length": dist_delaunay.copy(),
-                        "edge_voronoi_length": length_voronoi.copy(),
-                        "voronoi_nodes": self.vs.copy()
-                    }
+    #             # Save data at each integer time step
+    #             if np.mod(i*self.dt, 1) == 0:
+    #                 # Build adjacency + geometry
+    #                 (cell_adj,
+    #                 dist_delaunay,
+    #                 length_voronoi) = self.build_cell_adjacency_with_lengths()
 
-                    np.save(f"{output_dir}/data_{i}.npy", data_dict, allow_pickle=True)
+    #                 data_dict = {
+    #                     "cell_x": x.copy(),
+    #                     "cell_type": self.c_types.copy(),
+    #                     "area": self.A.copy(),
+    #                     "perimeter": self.P.copy(),
+    #                     "cell_adj": cell_adj.copy(),
+    #                     "edge_delaunay_length": dist_delaunay.copy(),
+    #                     "edge_voronoi_length": length_voronoi.copy(),
+    #                     "voronoi_nodes": self.vs.copy()
+    #                 }
 
-        else:
-            # (Variant without boundary tension, but same adjacency save logic)
-            for i in range(n_t):
-                if i % print_every == 0:
-                    print(f"{(i / n_t)*100:.1f}%")
+    #                 np.save(f"{output_dir}/data_{i}.npy", data_dict, allow_pickle=True)
 
-                self.triangulate(x, recalc_angles=True)
-                self.assign_vertices()
-                x = self.check_boundary(x)
+    #     else:
+    #         # (Variant without boundary tension, but same adjacency save logic)
+    #         for i in range(n_t):
+    #             if i % print_every == 0:
+    #                 print(f"{(i / n_t)*100:.1f}%")
 
-                self.tri_save[i, :self.tris.shape[0]] = self.tris
-                self.get_A(self.neighbours, self.vs)
-                self.get_P(self.neighbours, self.vs)
+    #             self.triangulate(x, recalc_angles=True)
+    #             self.assign_vertices()
+    #             x = self.check_boundary(x)
 
-                F = self.get_F(self.neighbours, self.vs)
-                F_soft = weak_repulsion_boundary(self.Cents, self.a, self.k,
-                                                self.CV_matrix, self.n_c, self.n_C)
+    #             self.tri_save[i, :self.tris.shape[0]] = self.tris
+    #             self.get_A(self.neighbours, self.vs)
+    #             self.get_P(self.neighbours, self.vs)
 
-                # Combine noise for cells + boundary
-                v0 = [self.v0[j] for j in self.c_types]
-                vp = np.repeat(1, self.n_c - self.n_C) * self.v0[-1]
-                v0 = np.concatenate((v0, vp))
-                noise = np.transpose(
-                    [v0*self.noise[i, :x.shape[0]][:, 0],
-                    v0*self.noise[i, :x.shape[0]][:, 1]]
-                )
+    #             F = self.get_F(self.neighbours, self.vs)
+    #             F_soft = weak_repulsion_boundary(self.Cents, self.a, self.k,
+    #                                             self.CV_matrix, self.n_c, self.n_C)
 
-                x += self.dt * (F + F_soft + noise)
-                self.x = x
-                self.x_save[i, :x.shape[0]] = x
+    #             # Combine noise for cells + boundary
+    #             v0 = [self.v0[j] for j in self.c_types]
+    #             vp = np.repeat(1, self.n_c - self.n_C) * self.v0[-1]
+    #             v0 = np.concatenate((v0, vp))
+    #             noise = np.transpose(
+    #                 [v0*self.noise[i, :x.shape[0]][:, 0],
+    #                 v0*self.noise[i, :x.shape[0]][:, 1]]
+    #             )
 
-                # Save data
-                if np.mod(i*self.dt, 1) == 0:
-                    (cell_adj,
-                    dist_delaunay,
-                    length_voronoi) = self.build_cell_adjacency_with_lengths()
+    #             x += self.dt * (F + F_soft + noise)
+    #             self.x = x
+    #             self.x_save[i, :x.shape[0]] = x
 
-                    data_dict = {
-                        "cell_x": x.copy(),
-                        "cell_type": self.c_types.copy(),
-                        "area": self.A.copy(),
-                        "perimeter": self.P.copy(),
-                        "cell_adj": cell_adj.copy(),
-                        "edge_delaunay_length": dist_delaunay.copy(),
-                        "edge_voronoi_length": length_voronoi.copy(),
-                        "voronoi_nodes": self.vs.copy()
-                    }
-                    np.save(f"{output_dir}/data_{i}.npy", data_dict, allow_pickle=True)
+    #             # Save data
+    #             if np.mod(i*self.dt, 1) == 0:
+    #                 (cell_adj,
+    #                 dist_delaunay,
+    #                 length_voronoi) = self.build_cell_adjacency_with_lengths()
 
-        print("Simulation complete")
-        return self.x_save
+    #                 data_dict = {
+    #                     "cell_x": x.copy(),
+    #                     "cell_type": self.c_types.copy(),
+    #                     "area": self.A.copy(),
+    #                     "perimeter": self.P.copy(),
+    #                     "cell_adj": cell_adj.copy(),
+    #                     "edge_delaunay_length": dist_delaunay.copy(),
+    #                     "edge_voronoi_length": length_voronoi.copy(),
+    #                     "voronoi_nodes": self.vs.copy()
+    #                 }
+    #                 np.save(f"{output_dir}/data_{i}.npy", data_dict, allow_pickle=True)
+
+    #     print("Simulation complete")
+    #     return self.x_save
