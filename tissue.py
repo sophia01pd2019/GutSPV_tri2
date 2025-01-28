@@ -712,23 +712,59 @@ class Tissue:
             adjacency[c1, c3] = 1
         return adjacency
 
-
-    def simulate(self, print_every=1000, variable_param=False, \
-                 output_dir="plots", rng_seed=1):
+    def order_voronoi_vertices(vertex_ids, v_neighbours):
         """
-        Evolve the SPV.
+        Given a list of Voronoi vertex IDs that all belong to the same cell–cell boundary,
+        place them in CCW order by walking the `v_neighbours` adjacency.
+
+        Simplest approach:
+        1. Start with any vertex in vertex_ids.
+        2. Find the next that shares an edge with it and also is in vertex_ids.
+        3. Continue until you recover a loop (or run out).
+
+        Returns: an ordered list of vertex IDs.
+        """
+        if len(vertex_ids) <= 2:
+            # With only 2 vertices, there's no fancy cycle to order.
+            return vertex_ids
+
+        ordered = [vertex_ids[0]]
+        used = set([vertex_ids[0]])
+
+        # Repeatedly pick a neighbor that is in vertex_ids but not used yet.
+        current = vertex_ids[0]
+        while True:
+            found_next = False
+            for nb in v_neighbours[current]:
+                if nb in vertex_ids and nb not in used and nb >= 0:
+                    # neighbor is a valid next vertex in the chain
+                    ordered.append(nb)
+                    used.add(nb)
+                    current = nb
+                    found_next = True
+                    break
+            if not found_next:
+                # No more neighbors in the set => we might have closed a loop or ended
+                break
+
+        return ordered
+
+    def simulate(self, print_every=1000, variable_param=False,
+             output_dir="plots", rng_seed=1):
+        """
+        Evolve the SPV (periodic boundary conditions).
 
         Stores:
-            self.x_save = Cell centroids for each time-step (n_t x n_c x 2), where n_t is the number of time-steps
+            self.x_save = Cell centroids for each time-step (n_t x n_c x 2)
             self.tri_save = Triangulation for each time-step (n_t x n_v x 3)
 
-
-        :param print_every: integer value to skip printing progress every "print_every" iterations.
-        :param variable_param: Set this to True if kappa_A,kappa_P are vectors rather than single values
-        :return: self.x_save
+        :param print_every: integer value to skip printing progress
+        :param variable_param: Set this to True if kappa_A,kappa_P are vectors
+        :param output_dir: Where to save output frames
+        :param rng_seed: random seed
+        :return: (self.x_save, self.tri_save)
         """
-
-        # TODO: detect whether kappa_* are vectors and act accordingly.
+        # If you have a separate method for param variation:
         if variable_param:
             F_get = self.get_F_periodic_param
         else:
@@ -795,17 +831,21 @@ class Tissue:
                                     dtype=object)
                 np.save(f"{output_dir}/{i}.npy", data_legacy, allow_pickle=True)
 
-                # (b) Build adjacency
-                cell_adj = self.build_cell_adjacency()
+                # (b) Build adjacency WITH lengths
+                (cell_adj,
+                dist_delaunay,
+                length_voronoi) = self.build_cell_adjacency_with_lengths()
 
                 # (c) Create data dictionary
                 data_dict = {
-                    "cell_x": x.copy(),
-                    "cell_type": self.c_types.copy(),
-                    "area": self.A.copy(),
-                    "perimeter": self.P.copy(),
-                    "cell_adj": cell_adj.copy(),
-                    "voronoi_nodes": self.vs.copy()
+                    "cell_x"          : x.copy(),
+                    "cell_type"       : self.c_types.copy(),
+                    "area"            : self.A.copy(),
+                    "perimeter"       : self.P.copy(),
+                    "cell_adj"        : cell_adj.copy(),
+                    "edge_delaunay_length" : dist_delaunay.copy(),
+                    "edge_voronoi_length"  : length_voronoi.copy(),
+                    "voronoi_nodes"   : self.vs.copy()
                 }
 
                 # (d) Save to e.g. data_0.npy, data_100.npy, etc.
@@ -815,20 +855,19 @@ class Tissue:
         return self.x_save, self.tri_save
 
 
-
-    def simulate_boundary(self, print_every=1000, do_F_bound=True, \
-                          output_dir="plots", rng_seed=1):
+    def simulate_boundary(self, print_every=1000, do_F_bound=True,
+                      output_dir="plots", rng_seed=1):
         """
-        Evolve the SPV but using boundaries.
+        Evolve the SPV but with boundary particles.
 
         Stores:
-            self.x_save = Cell centroids for each time-step (n_t x n_c x 2), where n_t is the number of time-steps
-            self.tri_save = Triangulation for each time-step (n_t x n_v x 3)
+            self.x_save = Cell centroids for each time-step (n_t x n_c x 2)
+            self.tri_save = Triangulation (n_t x n_v x 3)
 
-
-        :param print_every: integer value to skip printing progress every "print_every" iterations.
-        :param b_extra: Set this to >1. Defines the size of x_save to account for variable numbers of (boundary) cells.
-            if b_extra = 2, then x_save.shape[1] = 2*n_c (at t=0)
+        :param print_every: how often to print progress
+        :param do_F_bound: include boundary tension forces if True
+        :param output_dir: folder to save outputs
+        :param rng_seed: random seed
         :return: self.x_save
         """
         n_t = self.t_span.size
@@ -838,79 +877,113 @@ class Tissue:
         self.assign_vertices()
         x = self.check_boundary(x)
         self.x = x.copy()
-        self.x_save = np.ones((n_t,int(self.n_c*self.b_extra),2))*np.nan
-        self.tri_save = -np.ones((n_t,int(self.tris.shape[0]*self.b_extra),3),dtype=np.int32)
-        self.generate_noise_boundary()
+
+        self.x_save = np.ones((n_t, int(self.n_c*self.b_extra), 2))*np.nan
+        self.tri_save = -np.ones((n_t, int(self.tris.shape[0]*self.b_extra), 3), dtype=np.int32)
+
+        # Generate boundary noise
+        self.generate_noise_boundary(rng_seed=rng_seed)
 
         if do_F_bound is True:
             for i in range(n_t):
                 if i % print_every == 0:
-                    print(i / n_t * 100, "%")
-                self.triangulate(x,recalc_angles=True)
-                self.assign_vertices()
-                x = self.check_boundary(x)
-                self.tri_save[i,:self.tris.shape[0]] = self.tris
-                self.get_A(self.neighbours,self.vs)
-                self.get_P(self.neighbours,self.vs)
-                F = self.get_F(self.neighbours,self.vs)
-                # F_bend = get_F_bend(self.n_c, self.CV_matrix, self.n_C, x, self.zeta)
-                F_soft = weak_repulsion_boundary(self.Cents,self.a,self.k, self.CV_matrix,self.n_c,self.n_C)
-                F_bound = boundary_tension(self.Gamma_bound,self.n_C,self.n_c,self.Cents,self.CV_matrix)
-                
-                # Set per-cell noise given the multipliers for each cell type.
-                v0 = [self.v0[j] for j in self.c_types]
-                # NOTE: last element of v0 for boundary particles
-                vp = np.repeat(1, self.n_c-self.n_C) * self.v0[-1]
-                v0 = np.concatenate((v0, vp))   # motility for cells + particles
+                    print(f"{(i / n_t)*100:.1f}%")
 
-                noise = np.transpose( [v0*self.noise[i,:x.shape[0]][:,0], \
-                                       v0*self.noise[i,:x.shape[0]][:,1]] )
-
-                x += self.dt*(F + F_soft + noise + F_bound)
-                # x += self.dt*(F + F_soft + self.v0*self.noise[i,:x.shape[0]] + F_bound)
-                                # + F_bend + F_bound
-                
-                self.x = x
-                self.x_save[i,:x.shape[0]] = x
-
-                # Plot current state every integer time point.
-                if (np.mod(i*self.dt, 1) == 0):
-                    plot_step( self.x_save[i], i, self.domain_size, self.c_types, self.colors, 
-                               self.plot_scatter, self.tris, dir_name=output_dir, an_type="boundary" )
-        
-        else:
-            for i in range(n_t):
-                if i % print_every == 0:
-                    print(i / n_t * 100, "%")
                 self.triangulate(x, recalc_angles=True)
                 self.assign_vertices()
                 x = self.check_boundary(x)
+
                 self.tri_save[i, :self.tris.shape[0]] = self.tris
                 self.get_A(self.neighbours, self.vs)
                 self.get_P(self.neighbours, self.vs)
+
                 F = self.get_F(self.neighbours, self.vs)
-                F_soft = weak_repulsion_boundary(self.Cents, self.a, self.k, self.CV_matrix, self.n_c, self.n_C)
+                F_soft = weak_repulsion_boundary(self.Cents, self.a, self.k,
+                                                self.CV_matrix, self.n_c, self.n_C)
+                F_bound = boundary_tension(self.Gamma_bound, self.n_C, self.n_c,
+                                        self.Cents, self.CV_matrix)
 
-                # Set per-cell noise given the multipliers for each cell type.
+                # Combine noise for cells + boundary
                 v0 = [self.v0[j] for j in self.c_types]
-                # NOTE: last element of v0 for boundary particles
-                vp = np.repeat(1, self.n_c-self.n_C) * self.v0[-1]
-                v0 = np.concatenate((v0, vp))   # motility for cells + particles
-
-                noise = np.transpose( [v0*self.noise[i,:x.shape[0]][:,0], \
-                                       v0*self.noise[i,:x.shape[0]][:,1]] )
+                vp = np.repeat(1, self.n_c - self.n_C) * self.v0[-1]  # boundary part
+                v0 = np.concatenate((v0, vp))
+                noise = np.transpose(
+                    [v0*self.noise[i, :x.shape[0]][:, 0],
+                    v0*self.noise[i, :x.shape[0]][:, 1]]
+                )
 
                 x += self.dt*(F + F_soft + noise + F_bound)
-                # x += self.dt * (F + F_soft + self.v0*self.noise[i,:x.shape[0]])
-
                 self.x = x
                 self.x_save[i, :x.shape[0]] = x
 
-                # Plot current state every integer time point.
-                if (np.mod(i*self.dt, 1) == 0):
-                    plot_step( self.x_save[i], i, self.domain_size, self.c_types, self.colors, 
-                               self.plot_scatter, self.tris, dir_name=output_dir, an_type="boundary" )
-        
+                # Save data at each integer time step
+                if np.mod(i*self.dt, 1) == 0:
+                    # Build adjacency + geometry
+                    (cell_adj,
+                    dist_delaunay,
+                    length_voronoi) = self.build_cell_adjacency_with_lengths()
+
+                    data_dict = {
+                        "cell_x": x.copy(),
+                        "cell_type": self.c_types.copy(),
+                        "area": self.A.copy(),
+                        "perimeter": self.P.copy(),
+                        "cell_adj": cell_adj.copy(),
+                        "edge_delaunay_length": dist_delaunay.copy(),
+                        "edge_voronoi_length": length_voronoi.copy(),
+                        "voronoi_nodes": self.vs.copy()
+                    }
+
+                    np.save(f"{output_dir}/data_{i}.npy", data_dict, allow_pickle=True)
+
+        else:
+            # (Variant without boundary tension, but same adjacency save logic)
+            for i in range(n_t):
+                if i % print_every == 0:
+                    print(f"{(i / n_t)*100:.1f}%")
+
+                self.triangulate(x, recalc_angles=True)
+                self.assign_vertices()
+                x = self.check_boundary(x)
+
+                self.tri_save[i, :self.tris.shape[0]] = self.tris
+                self.get_A(self.neighbours, self.vs)
+                self.get_P(self.neighbours, self.vs)
+
+                F = self.get_F(self.neighbours, self.vs)
+                F_soft = weak_repulsion_boundary(self.Cents, self.a, self.k,
+                                                self.CV_matrix, self.n_c, self.n_C)
+
+                # Combine noise for cells + boundary
+                v0 = [self.v0[j] for j in self.c_types]
+                vp = np.repeat(1, self.n_c - self.n_C) * self.v0[-1]
+                v0 = np.concatenate((v0, vp))
+                noise = np.transpose(
+                    [v0*self.noise[i, :x.shape[0]][:, 0],
+                    v0*self.noise[i, :x.shape[0]][:, 1]]
+                )
+
+                x += self.dt * (F + F_soft + noise)
+                self.x = x
+                self.x_save[i, :x.shape[0]] = x
+
+                # Save data
+                if np.mod(i*self.dt, 1) == 0:
+                    (cell_adj,
+                    dist_delaunay,
+                    length_voronoi) = self.build_cell_adjacency_with_lengths()
+
+                    data_dict = {
+                        "cell_x": x.copy(),
+                        "cell_type": self.c_types.copy(),
+                        "area": self.A.copy(),
+                        "perimeter": self.P.copy(),
+                        "cell_adj": cell_adj.copy(),
+                        "edge_delaunay_length": dist_delaunay.copy(),
+                        "edge_voronoi_length": length_voronoi.copy(),
+                        "voronoi_nodes": self.vs.copy()
+                    }
+                    np.save(f"{output_dir}/data_{i}.npy", data_dict, allow_pickle=True)
+
         print("Simulation complete")
-        
         return self.x_save
